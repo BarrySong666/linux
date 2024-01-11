@@ -3714,7 +3714,7 @@ static inline bool should_try_to_free_swap(struct folio *folio,
 	 * reference only in case it's likely that we'll be the exlusive user.
 	 */
 	return (fault_flags & FAULT_FLAG_WRITE) && !folio_test_ksm(folio) &&
-		folio_ref_count(folio) == 2;
+		folio_ref_count(folio) == (1 + folio_nr_pages(folio));
 }
 
 static vm_fault_t pte_marker_clear(struct vm_fault *vmf)
@@ -3784,6 +3784,116 @@ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
+static bool pte_range_none_swap(pte_t *pte, int nr_pages)
+{
+	int i;
+	swp_entry_t swp_entry;
+
+	for (i = 0; i < nr_pages; i++) {
+		swp_entry = pte_to_swp_entry(ptep_get(pte + i));
+
+		if (non_swap_entry(swp_entry))
+			return false;
+	}
+
+	return true;
+}
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static bool pte_range_swap(pte_t *pte, int nr_pages)
+{
+	int i;
+	swp_entry_t swp_entry;
+	pgoff_t start_offset;
+
+	start_offset = swp_offset(pte_to_swp_entry(ptep_get(pte)));
+
+	for (i = 0; i < nr_pages; i++) {
+		swp_entry = pte_to_swp_entry(ptep_get(pte + i));
+		if (non_swap_entry(swp_entry))
+			return false;
+
+		if (swp_offset(swp_entry) != start_offset + i)
+			return false;
+	}
+
+	return true;
+}
+
+static struct folio *swap_vma_alloc_folio(struct vm_fault *vmf, swp_entry_t *entry)
+{
+	gfp_t gfp;
+	struct folio *folio;
+	pte_t *pte;
+	unsigned long addr;
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long orders;
+	swp_entry_t start_entry, end_entry;
+	int order;
+
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags, false, true, true,
+					  BIT(PMD_ORDER) - 1);
+	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
+	if (!orders)
+		goto fallback;
+
+	pte = pte_offset_map(vmf->pmd, vmf->address & PMD_MASK);
+	if (!pte)
+		return ERR_PTR(-EAGAIN);
+
+	order = highest_order(orders);
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		vmf->pte = pte + pte_index(addr);
+
+		start_entry = pte_to_swp_entry(ptep_get(vmf->pte));
+		end_entry = pte_to_swp_entry(ptep_get(vmf->pte +
+					      (1 << order) - 1));
+		if (non_swap_entry(start_entry) ||
+		    non_swap_entry(end_entry)) {
+			pte_unmap(pte);
+			goto fallback;
+		}
+
+		if (swp_offset(start_entry) + (1 << order) - 1 !=
+		    swp_offset(end_entry)) {
+			pte_unmap(pte);
+			goto fallback;
+		}
+
+		if (pte_range_swap(vmf->pte, 1 << order))
+			break;
+
+		order = next_order(&orders, order);
+	}
+
+	vmf->pte = NULL;
+	pte_unmap(pte);
+
+	gfp = vma_thp_gfp_mask(vma);
+
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		folio = vma_alloc_folio(gfp, order, vma, addr, true);
+		if (folio) {
+			clear_huge_page(&folio->page, addr, 1 << order);
+			*entry = start_entry;
+
+			return folio;
+		}
+		order = next_order(&orders, order);
+	}
+
+fallback:
+	return vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
+			vmf->vma, vmf->address, false);
+}
+#else
+#define swap_vma_alloc_folio(vmf, entry) \
+		vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, \
+			(vmf)->vma, (vmf)->address, false)
+#endif /* !CONFIG_TRANSPARENT_HUGEPAGE */
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -3804,6 +3914,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	pte_t pte;
 	vm_fault_t ret = 0;
 	void *shadow = NULL;
+	int nr_pages = 1;
+	unsigned long addr = vmf->address;
+	pte_t *cur_pte;
 
 	if (!pte_unmap_same(vmf))
 		goto out;
@@ -3868,8 +3981,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
 		    __swap_count(entry) == 1) {
 			/* skip swapcache */
-			folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
-						vma, vmf->address, false);
+			folio = swap_vma_alloc_folio(vmf, &entry);
 			page = &folio->page;
 			if (folio) {
 				__folio_set_locked(folio);
@@ -3928,6 +4040,16 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out_release;
 	}
 
+#if 0
+	/* 命中大业，但是部分小叶被unmap了 */
+	if (swapcache == folio && !(全局映射swp)) {
+		nr_pages和addr 保持不变
+	} else {
+		nr_pages = folio_nr_pages(folio);
+		addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
+	}
+#endif
+
 	ret |= folio_lock_or_retry(folio, vmf);
 	if (ret & VM_FAULT_RETRY)
 		goto out_release;
@@ -3978,9 +4100,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	/*
 	 * Back out if somebody else already faulted in this pte.
 	 */
-	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr,
 			&vmf->ptl);
-	if (unlikely(!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
+	if (unlikely(!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte)) ||
+	    (nr_pages  > 1 && !pte_range_none_swap(vmf->pte, nr_pages)))
 		goto out_nomap;
 
 	if (unlikely(!folio_test_uptodate(folio))) {
@@ -4047,12 +4170,13 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 * We're already holding a reference on the page but haven't mapped it
 	 * yet.
 	 */
-	swap_free(entry);
+	swap_nr_free(vmf, entry, nr_pages);
 	if (should_try_to_free_swap(folio, vma, vmf->flags))
 		folio_free_swap(folio);
 
-	inc_mm_counter(vma->vm_mm, MM_ANONPAGES);
-	dec_mm_counter(vma->vm_mm, MM_SWAPENTS);
+	folio_ref_add(folio, nr_pages - 1);
+	add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_pages);
+	add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_pages);
 	pte = mk_pte(page, vma->vm_page_prot);
 
 	/*
@@ -4062,7 +4186,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 * exclusivity.
 	 */
 	if (!folio_test_ksm(folio) &&
-	    (exclusive || folio_ref_count(folio) == 1)) {
+	    (exclusive || folio_ref_count(folio) == nr_pages)) {
 		if (vmf->flags & FAULT_FLAG_WRITE) {
 			pte = maybe_mkwrite(pte_mkdirty(pte), vma);
 			vmf->flags &= ~FAULT_FLAG_WRITE;
@@ -4081,13 +4205,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		folio_add_new_anon_rmap(folio, vma, vmf->address);
 		folio_add_lru_vma(folio, vma);
 	} else {
-		folio_add_anon_rmap_pte(folio, page, vma, vmf->address,
+		folio_add_anon_rmap_ptes(folio, page, nr_pages, vma, addr,
 					rmap_flags);
 	}
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 			(pte_write(pte) && !PageAnonExclusive(page)));
-	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+	set_ptes(vma->vm_mm, addr, vmf->pte, pte, nr_pages);
+
 	arch_do_swap_page(vma->vm_mm, vma, vmf->address, pte, vmf->orig_pte);
 
 	folio_unlock(folio);
@@ -4105,6 +4230,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 	if (vmf->flags & FAULT_FLAG_WRITE) {
+		cur_pte = vmf->pte + ((vmf->address & (nr_pages * PAGE_SIZE - 1)) / PAGE_SIZE);
+		vmf->orig_pte = ptep_get(cur_pte);
 		ret |= do_wp_page(vmf);
 		if (ret & VM_FAULT_ERROR)
 			ret &= VM_FAULT_ERROR;
@@ -4112,7 +4239,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 	/* No need to invalidate - it was non-present before */
-	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, nr_pages);
 unlock:
 	if (vmf->pte)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);

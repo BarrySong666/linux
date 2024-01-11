@@ -1335,6 +1335,37 @@ void swap_free(swp_entry_t entry)
 		__swap_entry_free(p, entry);
 }
 
+void swap_nr_free(struct vm_fault *vmf, swp_entry_t entry, int nr_pages)
+{
+	int i;
+	struct swap_cluster_info *ci;
+	struct swap_info_struct *p;
+	unsigned type = swp_type(entry);
+	unsigned long offset = swp_offset(entry);
+	/* bit[0] - bit[8*64 - 1] = bit[0] - bit[511] */
+	unsigned long usage_mask[8] = {0};
+	int bit_width = sizeof(unsigned long) * 8;
+
+	if (nr_pages == 1) {
+		swap_free(entry);
+		return;
+	}
+
+	p = _swap_info_get(entry);
+
+	ci = lock_cluster(p, offset);
+	for (i = 0; i < nr_pages; i++) {
+		if (__swap_entry_free_locked(p, offset + i, 1))
+			set_bit(i % bit_width, &usage_mask[i / bit_width]);
+	}
+	unlock_cluster(ci);
+
+	for (i = 0; i < nr_pages; i++) {
+		if (!test_bit(i % bit_width, &usage_mask[i / bit_width]))
+			free_swap_slot(swp_entry(type, offset + i));
+	}
+}
+
 /*
  * Called after dropping swapcache to decrease refcnt to swap entries.
  */
