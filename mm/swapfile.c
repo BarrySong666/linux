@@ -1342,6 +1342,41 @@ void swap_free(swp_entry_t entry)
 }
 
 /*
+ * Called after swapping in a large folio, batched free swap entries
+ * for this large folio, entry should be for the first subpage and
+ * its offset is aligned with nr_pages
+ */
+void swap_nr_free(swp_entry_t entry, int nr_pages)
+{
+	int i;
+	struct swap_cluster_info *ci;
+	struct swap_info_struct *p;
+	unsigned type = swp_type(entry);
+	unsigned long offset = swp_offset(entry);
+	DECLARE_BITMAP(usage, SWAPFILE_CLUSTER) = { 0 };
+
+	/* all swap entries are within a cluster for mTHP */
+	VM_BUG_ON(offset % SWAPFILE_CLUSTER + nr_pages > SWAPFILE_CLUSTER);
+
+	if (nr_pages == 1) {
+		swap_free(entry);
+		return;
+	}
+
+	p = _swap_info_get(entry);
+
+	ci = lock_cluster(p, offset);
+	for (i = 0; i < nr_pages; i++) {
+		if (__swap_entry_free_locked(p, offset + i, 1))
+			__bitmap_set(usage, i, 1);
+	}
+	unlock_cluster(ci);
+
+	for_each_clear_bit(i, usage, nr_pages)
+		free_swap_slot(swp_entry(type, offset + i));
+}
+
+/*
  * Called after dropping swapcache to decrease refcnt to swap entries.
  */
 void put_swap_folio(struct folio *folio, swp_entry_t entry)
