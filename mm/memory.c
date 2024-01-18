@@ -3908,6 +3908,136 @@ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
 }
 
 /*
+ * check a range of PTEs are completely swap entries with
+ * contiguous swap offsets and the same SWAP_HAS_CACHE.
+ * pte must be first one in the range
+ */
+static bool is_pte_range_contig_swap(pte_t *pte, int nr_pages)
+{
+	int i;
+	struct swap_info_struct *si;
+	swp_entry_t entry;
+	unsigned type;
+	pgoff_t start_offset;
+	char has_cache;
+
+	entry = pte_to_swp_entry(ptep_get_lockless(pte));
+	if (non_swap_entry(entry))
+		return false;
+	start_offset = swp_offset(entry);
+	if (start_offset % nr_pages)
+		return false;
+
+	si = swp_swap_info(entry);
+	type = swp_type(entry);
+	has_cache = si->swap_map[start_offset] & SWAP_HAS_CACHE;
+	for (i = 1; i < nr_pages; i++) {
+		entry = pte_to_swp_entry(ptep_get_lockless(pte + i));
+		if (non_swap_entry(entry))
+			return false;
+		if (swp_offset(entry) != start_offset + i)
+			return false;
+		if (swp_type(entry) != type)
+			return false;
+		/*
+		 * while allocating a large folio and doing swap_read_folio for the
+		 * SWP_SYNCHRONOUS_IO path, which is the case the being faulted pte
+		 * doesn't have swapcache. We need to ensure all PTEs have no cache
+		 * as well, otherwise, we might go to swap devices while the content
+		 * is in swapcache
+		 */
+		if ((si->swap_map[start_offset + i] & SWAP_HAS_CACHE) != has_cache)
+			return false;
+	}
+
+	return true;
+}
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+/*
+ * Get a list of all the (large) orders below PMD_ORDER that are enabled
+ * for this vma. Then filter out the orders that can't be allocated over
+ * the faulting address and still be fully contained in the vma.
+ */
+static inline unsigned long get_alloc_folio_orders(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long orders;
+
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags, false, true, true,
+					  BIT(PMD_ORDER) - 1);
+	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
+	return orders;
+}
+#endif
+
+static struct folio *alloc_swap_folio(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	unsigned long orders;
+	struct folio *folio;
+	unsigned long addr;
+	pte_t *pte;
+	gfp_t gfp;
+	int order;
+
+	/*
+	 * If uffd is active for the vma we need per-page fault fidelity to
+	 * maintain the uffd semantics.
+	 */
+	if (unlikely(userfaultfd_armed(vma)))
+		goto fallback;
+
+	/*
+	 * a large folio being swapped-in could be partially in
+	 * zswap and partially in swap devices, zswap doesn't
+	 * support large folios yet, we might get corrupted
+	 * zero-filled data by reading all subpages from swap
+	 * devices while some of them are actually in zswap
+	 */
+	if (is_zswap_enabled())
+		goto fallback;
+
+	orders = get_alloc_folio_orders(vmf);
+	if (!orders)
+		goto fallback;
+
+	pte = pte_offset_map(vmf->pmd, vmf->address & PMD_MASK);
+	if (unlikely(!pte))
+		goto fallback;
+
+	/*
+	 * For do_swap_page, find the highest order where the aligned range is
+	 * completely swap entries with contiguous swap offsets.
+	 */
+	order = highest_order(orders);
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		if (is_pte_range_contig_swap(pte + pte_index(addr), 1 << order))
+			break;
+		order = next_order(&orders, order);
+	}
+
+	pte_unmap(pte);
+
+	/* Try allocating the highest of the remaining orders. */
+	gfp = vma_thp_gfp_mask(vma);
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		folio = vma_alloc_folio(gfp, order, vma, addr, true);
+		if (folio)
+			return folio;
+		order = next_order(&orders, order);
+	}
+
+fallback:
+#endif
+	return vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, vmf->address, false);
+}
+
+
+/*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
  * We return with pte unmapped and unlocked.
@@ -3928,6 +4058,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	pte_t pte;
 	vm_fault_t ret = 0;
 	void *shadow = NULL;
+	int nr_pages = 1;
+	unsigned long start_address;
+	pte_t *start_pte;
 
 	if (!pte_unmap_same(vmf))
 		goto out;
@@ -3991,27 +4124,31 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (!folio) {
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
 		    __swap_count(entry) == 1) {
-			/*
-			 * Prevent parallel swapin from proceeding with
-			 * the cache flag. Otherwise, another thread may
-			 * finish swapin first, free the entry, and swapout
-			 * reusing the same entry. It's undetectable as
-			 * pte_same() returns true due to entry reuse.
-			 */
-			if (swapcache_prepare(entry)) {
-				/* Relax a bit to prevent rapid repeated page faults */
-				schedule_timeout_uninterruptible(1);
-				goto out;
-			}
-			need_clear_cache = true;
-
 			/* skip swapcache */
-			folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
-						vma, vmf->address, false);
+			folio = alloc_swap_folio(vmf);
 			page = &folio->page;
 			if (folio) {
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
+
+				if (folio_test_large(folio)) {
+					nr_pages = folio_nr_pages(folio);
+					entry.val = ALIGN_DOWN(entry.val, nr_pages);
+				}
+
+				/*
+				 * Prevent parallel swapin from proceeding with
+				 * the cache flag. Otherwise, another thread may
+				 * finish swapin first, free the entry, and swapout
+				 * reusing the same entry. It's undetectable as
+				 * pte_same() returns true due to entry reuse.
+				 */
+				if (swapcache_prepare_nr(entry, nr_pages)) {
+					/* Relax a bit to prevent rapid repeated page faults */
+					schedule_timeout_uninterruptible(1);
+					goto out;
+				}
+				need_clear_cache = true;
 
 				if (mem_cgroup_swapin_charge_folio(folio,
 							vma->vm_mm, GFP_KERNEL,
@@ -4019,7 +4156,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 					ret = VM_FAULT_OOM;
 					goto out_page;
 				}
-				mem_cgroup_swapin_uncharge_swap(entry);
+
+				for (swp_entry_t e = entry; e.val < entry.val + nr_pages; e.val++)
+					mem_cgroup_swapin_uncharge_swap(e);
 
 				shadow = get_shadow_from_swap_cache(entry);
 				if (shadow)
@@ -4118,6 +4257,42 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 */
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
 			&vmf->ptl);
+
+	start_address = vmf->address;
+	start_pte = vmf->pte;
+	if (start_pte && folio_test_large(folio)) {
+		unsigned long nr = folio_nr_pages(folio);
+		unsigned long addr = ALIGN_DOWN(vmf->address, nr * PAGE_SIZE);
+		pte_t *aligned_pte = vmf->pte - (vmf->address - addr) / PAGE_SIZE;
+
+		/*
+		 * case 1: we are allocating large_folio, try to map it as a whole
+		 * iff the swap entries are still entirely mapped;
+		 * case 2: we hit a large folio in swapcache, and all swap entries
+		 * are still entirely mapped, try to map a large folio as a whole.
+		 * otherwise, map only the faulting page within the large folio
+		 * which is swapcache
+		 */
+		if (!is_pte_range_contig_swap(aligned_pte, nr)) {
+			if (nr_pages > 1) /* ptes have changed for case 1 */
+				goto out_nomap;
+			goto check_pte;
+		}
+
+		start_address = addr;
+		start_pte = aligned_pte;
+		/*
+		 * the below has been done before swap_read_folio()
+		 * for case 1
+		 */
+		if (unlikely(folio == swapcache)) {
+			nr_pages = nr;
+			entry.val = ALIGN_DOWN(entry.val, nr_pages);
+			page = &folio->page;
+		}
+	}
+
+check_pte:
 	if (unlikely(!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
 		goto out_nomap;
 
@@ -4185,12 +4360,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 * We're already holding a reference on the page but haven't mapped it
 	 * yet.
 	 */
-	swap_free(entry);
+	swap_nr_free(entry, nr_pages);
 	if (should_try_to_free_swap(folio, vma, vmf->flags))
 		folio_free_swap(folio);
 
-	inc_mm_counter(vma->vm_mm, MM_ANONPAGES);
-	dec_mm_counter(vma->vm_mm, MM_SWAPENTS);
+	folio_ref_add(folio, nr_pages - 1);
+	add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_pages);
+	add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_pages);
+
 	pte = mk_pte(page, vma->vm_page_prot);
 
 	/*
@@ -4200,14 +4377,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 * exclusivity.
 	 */
 	if (!folio_test_ksm(folio) &&
-	    (exclusive || folio_ref_count(folio) == 1)) {
+	    (exclusive || folio_ref_count(folio) == nr_pages)) {
 		if (vmf->flags & FAULT_FLAG_WRITE) {
 			pte = maybe_mkwrite(pte_mkdirty(pte), vma);
 			vmf->flags &= ~FAULT_FLAG_WRITE;
 		}
 		rmap_flags |= RMAP_EXCLUSIVE;
 	}
-	flush_icache_page(vma, page);
+	flush_icache_pages(vma, page, nr_pages);
 	if (pte_swp_soft_dirty(vmf->orig_pte))
 		pte = pte_mksoft_dirty(pte);
 	if (pte_swp_uffd_wp(vmf->orig_pte))
@@ -4216,17 +4393,19 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 
 	/* ksm created a completely new copy */
 	if (unlikely(folio != swapcache && swapcache)) {
-		folio_add_new_anon_rmap(folio, vma, vmf->address);
+		folio_add_new_anon_rmap(folio, vma, start_address);
 		folio_add_lru_vma(folio, vma);
+	} else if (!folio_test_anon(folio)) {
+		folio_add_new_anon_rmap(folio, vma, start_address);
 	} else {
-		folio_add_anon_rmap_pte(folio, page, vma, vmf->address,
+		folio_add_anon_rmap_ptes(folio, page, nr_pages, vma, start_address,
 					rmap_flags);
 	}
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 			(pte_write(pte) && !PageAnonExclusive(page)));
-	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
-	arch_do_swap_page(vma->vm_mm, vma, vmf->address, pte, vmf->orig_pte);
+	set_ptes(vma->vm_mm, start_address, start_pte, pte, nr_pages);
+	arch_do_swap_page(vma->vm_mm, vma, start_address, pte, vmf->orig_pte);
 
 	folio_unlock(folio);
 	if (folio != swapcache && swapcache) {
@@ -4243,6 +4422,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 	if (vmf->flags & FAULT_FLAG_WRITE) {
+		if (nr_pages > 1)
+			vmf->orig_pte = ptep_get(vmf->pte);
+
 		ret |= do_wp_page(vmf);
 		if (ret & VM_FAULT_ERROR)
 			ret &= VM_FAULT_ERROR;
@@ -4250,14 +4432,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 	/* No need to invalidate - it was non-present before */
-	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	update_mmu_cache_range(vmf, vma, start_address, start_pte, nr_pages);
 unlock:
 	if (vmf->pte)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 out:
 	/* Clear the swap cache pin for direct swapin after PTL unlock */
 	if (need_clear_cache)
-		swapcache_clear(si, entry);
+		swapcache_clear_nr(si, entry, nr_pages);
 	if (si)
 		put_swap_device(si);
 	return ret;
@@ -4273,7 +4455,7 @@ out_release:
 		folio_put(swapcache);
 	}
 	if (need_clear_cache)
-		swapcache_clear(si, entry);
+		swapcache_clear_nr(si, entry, nr_pages);
 	if (si)
 		put_swap_device(si);
 	return ret;
@@ -4309,15 +4491,7 @@ static struct folio *alloc_anon_folio(struct vm_fault *vmf)
 	if (unlikely(userfaultfd_armed(vma)))
 		goto fallback;
 
-	/*
-	 * Get a list of all the (large) orders below PMD_ORDER that are enabled
-	 * for this vma. Then filter out the orders that can't be allocated over
-	 * the faulting address and still be fully contained in the vma.
-	 */
-	orders = thp_vma_allowable_orders(vma, vma->vm_flags, false, true, true,
-					  BIT(PMD_ORDER) - 1);
-	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
-
+	orders = get_alloc_folio_orders(vmf);
 	if (!orders)
 		goto fallback;
 
