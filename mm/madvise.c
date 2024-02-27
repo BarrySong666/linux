@@ -321,6 +321,24 @@ static inline bool can_do_file_pageout(struct vm_area_struct *vma)
 	       file_permission(vma->vm_file, MAY_WRITE) == 0;
 }
 
+static inline void folio_deactivate_or_add_to_reclaim_list(struct folio *folio, bool pageout,
+				struct list_head *folio_list)
+{
+	folio_clear_referenced(folio);
+	folio_test_clear_young(folio);
+
+	if (folio_test_active(folio))
+		folio_set_workingset(folio);
+	if (!pageout)
+		return folio_deactivate(folio);
+	if (folio_isolate_lru(folio)) {
+		if (folio_test_unevictable(folio))
+			folio_putback_lru(folio);
+		else
+			list_add(&folio->lru, folio_list);
+	}
+}
+
 static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 				unsigned long addr, unsigned long end,
 				struct mm_walk *walk)
@@ -394,19 +412,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 			tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
 		}
 
-		folio_clear_referenced(folio);
-		folio_test_clear_young(folio);
-		if (folio_test_active(folio))
-			folio_set_workingset(folio);
-		if (pageout) {
-			if (folio_isolate_lru(folio)) {
-				if (folio_test_unevictable(folio))
-					folio_putback_lru(folio);
-				else
-					list_add(&folio->lru, &folio_list);
-			}
-		} else
-			folio_deactivate(folio);
+		folio_deactivate_or_add_to_reclaim_list(folio, pageout, &folio_list);
 huge_unlock:
 		spin_unlock(ptl);
 		if (pageout)
@@ -498,25 +504,7 @@ restart:
 			tlb_remove_tlb_entry(tlb, pte, addr);
 		}
 
-		/*
-		 * We are deactivating a folio for accelerating reclaiming.
-		 * VM couldn't reclaim the folio unless we clear PG_young.
-		 * As a side effect, it makes confuse idle-page tracking
-		 * because they will miss recent referenced history.
-		 */
-		folio_clear_referenced(folio);
-		folio_test_clear_young(folio);
-		if (folio_test_active(folio))
-			folio_set_workingset(folio);
-		if (pageout) {
-			if (folio_isolate_lru(folio)) {
-				if (folio_test_unevictable(folio))
-					folio_putback_lru(folio);
-				else
-					list_add(&folio->lru, &folio_list);
-			}
-		} else
-			folio_deactivate(folio);
+		folio_deactivate_or_add_to_reclaim_list(folio, pageout, &folio_list);
 	}
 
 	if (start_pte) {
