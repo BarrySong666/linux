@@ -271,8 +271,9 @@ static void discard_swap_cluster(struct swap_info_struct *si,
 }
 
 #ifdef CONFIG_THP_SWAP
-#define SWAPFILE_CLUSTER	HPAGE_PMD_NR
+/*#define SWAPFILE_CLUSTER	HPAGE_PMD_NR */
 
+#define SWAPFILE_CLUSTER	16
 #define swap_entry_size(size)	(size)
 #else
 #define SWAPFILE_CLUSTER	256
